@@ -1,0 +1,68 @@
+# Sha256 against std/digest's SHA256 (FIPS 180-4 in software, which has
+# its own tests): every length to 2 KB in one piece and in uneven pieces,
+# a large input, FIPS 180-4's examples, then all of it again on the
+# software rounds alone.
+module sha2/sha256_test
+
+import std/digest::{SHA256}
+import std/math::{Math}
+import sha2/sha256::{Sha256}
+
+def message(size : Int32) : String
+  String.build(size) do |io|
+    i = 0
+    while i < size
+      io << ((i * 7 + size) % 256).chr
+      i = i + 1
+    end
+  end
+end
+
+def check(label : String, failures : Int32) : Int32
+  ["", "abc", "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"].each do |text|
+    got = Sha256.hexdigest(text)
+    want = SHA256.hexdigest(text)
+    unless got == want
+      puts "FAIL #{label} #{text.inspect}: #{got} != #{want}"
+      failures = failures + 1
+    end
+  end
+  size = 0
+  while size <= 2100
+    text = message(size)
+    want = SHA256.hexdigest(text)
+    got = Sha256.hexdigest(text)
+    digest = Sha256.new
+    at = 0
+    step = 1
+    bytes = text.bytesize
+    while at < bytes
+      take = Math.min(step, bytes - at)
+      digest.update(Str.view(text)[at, take])
+      at = at + take
+      step = step * 3 % 97 + 1
+    end
+    pieces = digest.hexfinal
+    unless got == want && pieces == want
+      puts "FAIL #{label} size #{size}: #{got} #{pieces} != #{want}"
+      failures = failures + 1
+    end
+    size = size + 1
+  end
+  big = message(1_000_003)
+  unless Sha256.hexdigest(big) == SHA256.hexdigest(big)
+    puts "FAIL #{label} 1 MB"
+    failures = failures + 1
+  end
+  failures
+end
+
+abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+failures = 0
+failures = failures + 1 unless Sha256.hexdigest("abc") == abc
+failures = check("native", failures)
+puts "native: SHA-NI #{Sha256.shani? ? "yes" : "no"}"
+Sha256.use_software
+failures = check("software", failures)
+puts failures == 0 ? "sha256: ok" : "sha256: #{failures} failures"
+exit 1 if failures > 0

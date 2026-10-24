@@ -1,0 +1,512 @@
+# SHA-256 (FIPS 180-4) with the processor's SHA instructions where it has
+# them: RustCrypto sha2 0.10.9's x86_64 backend (src/sha256/x86.rs), its
+# intrinsics written out as one asm block that compresses every whole
+# block at once. Elsewhere, and on a processor without SHA-NI, the same
+# crate's software rounds (src/sha256/soft.rs, as FIPS 180-4 spells them).
+#
+# `Sha256.hexdigest(data)` hashes one piece; `Sha256.new`, `update` as
+# the data arrives, then `final` or `hexfinal` once, hashes it in pieces.
+# Data is a `Str` or a `String`.
+#
+# `@[Ffi]` because the asm is an edge as a C library's is: it takes the
+# state and the data by pointer. Nothing outside this module sees one.
+@[Ffi]
+module sha2/sha256
+
+import std/int
+import std/math::{Math}
+import std/static_array
+
+K = [
+  0x428a2f98_u32, 0x71374491_u32, 0xb5c0fbcf_u32, 0xe9b5dba5_u32,
+  0x3956c25b_u32, 0x59f111f1_u32, 0x923f82a4_u32, 0xab1c5ed5_u32,
+  0xd807aa98_u32, 0x12835b01_u32, 0x243185be_u32, 0x550c7dc3_u32,
+  0x72be5d74_u32, 0x80deb1fe_u32, 0x9bdc06a7_u32, 0xc19bf174_u32,
+  0xe49b69c1_u32, 0xefbe4786_u32, 0x0fc19dc6_u32, 0x240ca1cc_u32,
+  0x2de92c6f_u32, 0x4a7484aa_u32, 0x5cb0a9dc_u32, 0x76f988da_u32,
+  0x983e5152_u32, 0xa831c66d_u32, 0xb00327c8_u32, 0xbf597fc7_u32,
+  0xc6e00bf3_u32, 0xd5a79147_u32, 0x06ca6351_u32, 0x14292967_u32,
+  0x27b70a85_u32, 0x2e1b2138_u32, 0x4d2c6dfc_u32, 0x53380d13_u32,
+  0x650a7354_u32, 0x766a0abb_u32, 0x81c2c92e_u32, 0x92722c85_u32,
+  0xa2bfe8a1_u32, 0xa81a664b_u32, 0xc24b8b70_u32, 0xc76c51a3_u32,
+  0xd192e819_u32, 0xd6990624_u32, 0xf40e3585_u32, 0x106aa070_u32,
+  0x19a4c116_u32, 0x1e376c08_u32, 0x2748774c_u32, 0x34b0bcb5_u32,
+  0x391c0cb3_u32, 0x4ed8aa4a_u32, 0x5b9cca4f_u32, 0x682e6ff3_u32,
+  0x748f82ee_u32, 0x78a5636f_u32, 0x84c87814_u32, 0x8cc70208_u32,
+  0x90befffa_u32, 0xa4506ceb_u32, 0xbef9a3f7_u32, 0xc67178f2_u32,
+]
+
+HEX = "0123456789abcdef"
+
+# Bytes of whole blocks `update` copies off a Str at a time.
+BUFFER = 4096
+
+pub class Sha256
+  # A, B, ..., H.
+  @state : Pointer(UInt32)
+  # The message's last bytes that do not yet make a block.
+  @block : Pointer(UInt8)
+  # Whole blocks copied off a Str, for the asm to read.
+  @buffer : Pointer(UInt8)
+  @fill : Int32
+  @length : UInt64
+  @finished : Bool
+
+  # 0 not asked yet, 1 the processor has SHA-NI, 2 it does not.
+  @@shani : Int32 = 0
+  # K, and pshufb's mask that turns each 32-bit word big-endian, where the
+  # asm loads them from.
+  @@k : Pointer(UInt32) = Pointer(UInt32).malloc(64_u64)
+  @@mask : Pointer(UInt8) = Pointer(UInt8).malloc(16_u64)
+  @@filled : Bool = false
+
+  def initialize
+    @state = Pointer(UInt32).malloc(8_u64)
+    @block = Pointer(UInt8).malloc(64_u64)
+    @buffer = Pointer(UInt8).malloc(BUFFER.to_u64)
+    @fill = 0
+    @length = 0_u64
+    @finished = false
+    reset
+  end
+
+  # The software rounds from now on, whatever the processor has: for
+  # tests, which hold both paths to the same digests.
+  def self.use_software : Nil
+    @@shani = 2
+  end
+
+  def self.hexdigest(data : Str) : String
+    digest = new
+    digest.update(data)
+    digest.hexfinal
+  end
+
+  def self.hexdigest(data : String) : String
+    hexdigest(Str.view(data))
+  end
+
+  def reset : Nil
+    @state[0] = 0x6a09e667_u32
+    @state[1] = 0xbb67ae85_u32
+    @state[2] = 0x3c6ef372_u32
+    @state[3] = 0xa54ff53a_u32
+    @state[4] = 0x510e527f_u32
+    @state[5] = 0x9b05688c_u32
+    @state[6] = 0x1f83d9ab_u32
+    @state[7] = 0x5be0cd19_u32
+    @fill = 0
+    @length = 0_u64
+    @finished = false
+  end
+
+  def update(data : String) : self
+    update(Str.view(data))
+  end
+
+  # A Str's bytes are read as the tape allows, with bounds: the whole
+  # blocks eight bytes a load into the buffer, up to `BUFFER` at a time,
+  # then hashed from there; a part block byte by byte into `@block`.
+  def update(data : Str) : self
+    raise "Sha256#update after final" if @finished
+    size = data.bytesize
+    @length = @length &+ size.to_u64
+    at = 0
+    if @fill > 0
+      while @fill < 64 && at < size
+        @block[@fill] = data[at]
+        @fill = @fill + 1
+        at = at + 1
+      end
+      return self if @fill < 64
+      compress(@block, 1)
+      @fill = 0
+    end
+    words = @buffer.as(Pointer(UInt64))
+    while size - at >= 64
+      blocks = Math.min((size - at) // 64, BUFFER // 64)
+      i = 0
+      count = blocks * 8
+      while i < count
+        words[i] = data.read_bytes_at(UInt64, at + i * 8)
+        i = i + 1
+      end
+      compress(@buffer, blocks)
+      at = at + blocks * 64
+    end
+    while at < size
+      @block[@fill] = data[at]
+      @fill = @fill + 1
+      at = at + 1
+    end
+    self
+  end
+
+  # The 32 bytes of the digest.
+  def final : Array(UInt8)
+    raise "Sha256#final twice" if @finished
+    bits = @length &* 8_u64
+    @block[@fill] = 0x80_u8
+    @fill = @fill + 1
+    if @fill > 56
+      while @fill < 64
+        @block[@fill] = 0_u8
+        @fill = @fill + 1
+      end
+      compress(@block, 1)
+      @fill = 0
+    end
+    while @fill < 56
+      @block[@fill] = 0_u8
+      @fill = @fill + 1
+    end
+    i = 0
+    while i < 8
+      @block[56 + i] = (bits.unsafe_shr(56 - 8 * i) & 255_u64).to_u8
+      i = i + 1
+    end
+    compress(@block, 1)
+    @finished = true
+    out = Array(UInt8).new(32)
+    i = 0
+    while i < 8
+      word = @state[i]
+      out << (word.unsafe_shr(24) & 255_u32).to_u8
+      out << (word.unsafe_shr(16) & 255_u32).to_u8
+      out << (word.unsafe_shr(8) & 255_u32).to_u8
+      out << (word & 255_u32).to_u8
+      i = i + 1
+    end
+    out
+  end
+
+  def hexfinal : String
+    String.build(64) do |io|
+      final.each do |byte|
+        io << HEX[(byte >> 4).to_i32]
+        io << HEX[(byte & 0x0f_u8).to_i32]
+      end
+    end
+  end
+
+  # *count* whole blocks from *data* into the state.
+  private def compress(data : Pointer(UInt8), count : Int32) : Nil
+    {% if flag?(:x86_64) %}
+      if Sha256.shani?
+        Sha256.compress_shani(@state, data, count)
+        return
+      end
+    {% end %}
+    i = 0
+    while i < count
+      compress_soft(data + i * 64)
+      i = i + 1
+    end
+  end
+
+  {% if flag?(:x86_64) %}
+    # SHA-NI (leaf 7, EBX bit 29), with SSSE3 and SSE4.1 (leaf 1, ECX bits
+    # 9 and 19) that the loop's byte shuffles and blends are, asked once.
+    # `cpuid` writes rbx, which the code around it may hold, so it is kept
+    # in rsi meanwhile.
+    def self.shani? : Bool
+      shani = @@shani
+      if shani == 0
+        leaf = uninitialized UInt64
+        features = uninitialized UInt64
+        asm("cpuid" : "={rax}"(leaf), "={rcx}"(features)
+                    : "{rax}"(1_u64), "{rcx}"(0_u64)
+                    : "rbx", "rdx")
+        extended = uninitialized UInt64
+        asm("movq %rbx, %rsi
+             cpuid
+             xchgq %rbx, %rsi" : "={rax}"(leaf), "={rsi}"(extended)
+                               : "{rax}"(7_u64), "{rcx}"(0_u64)
+                               : "rcx", "rdx")
+        wanted = 0x80200_u64
+        has = features & wanted == wanted && extended & 0x20000000_u64 != 0_u64
+        shani = has ? 1 : 2
+        @@shani = shani
+      end
+      shani == 1
+    end
+
+    def self.compress_shani(state : Pointer(UInt32), data : Pointer(UInt8), count : Int32) : Nil
+      k = @@k
+      mask = @@mask
+      unless @@filled
+        i = 0
+        while i < 64
+          k[i] = K[i]
+          i = i + 1
+        end
+        i = 0
+        while i < 16
+          mask[i] = (i // 4 * 4 + 3 - i % 4).to_u8
+          i = i + 1
+        end
+        @@filled = true
+      end
+      asm("movq %rsi, %r9
+           movq %rdx, %r10
+           movdqu (%r8), %xmm8
+           movdqu (%rdi), %xmm1
+           movdqu 16(%rdi), %xmm2
+           pshufd $$0xB1, %xmm1, %xmm1
+           pshufd $$0x1B, %xmm2, %xmm2
+           movdqa %xmm1, %xmm11
+           palignr $$8, %xmm2, %xmm11
+           pblendw $$0xF0, %xmm1, %xmm2
+           movdqa %xmm11, %xmm1
+           1:
+           movdqa %xmm1, %xmm9
+           movdqa %xmm2, %xmm10
+           movdqu 0(%r9), %xmm3
+           pshufb %xmm8, %xmm3
+           movdqu 16(%r9), %xmm4
+           pshufb %xmm8, %xmm4
+           movdqu 32(%r9), %xmm5
+           pshufb %xmm8, %xmm5
+           movdqu 48(%r9), %xmm6
+           pshufb %xmm8, %xmm6
+           movdqa %xmm3, %xmm0
+           paddd 0(%rcx), %xmm0
+           sha256rnds2 %xmm0, %xmm1, %xmm2
+           pshufd $$0x0E, %xmm0, %xmm0
+           sha256rnds2 %xmm0, %xmm2, %xmm1
+           movdqa %xmm4, %xmm0
+           paddd 16(%rcx), %xmm0
+           sha256rnds2 %xmm0, %xmm1, %xmm2
+           pshufd $$0x0E, %xmm0, %xmm0
+           sha256rnds2 %xmm0, %xmm2, %xmm1
+           movdqa %xmm5, %xmm0
+           paddd 32(%rcx), %xmm0
+           sha256rnds2 %xmm0, %xmm1, %xmm2
+           pshufd $$0x0E, %xmm0, %xmm0
+           sha256rnds2 %xmm0, %xmm2, %xmm1
+           movdqa %xmm6, %xmm0
+           paddd 48(%rcx), %xmm0
+           sha256rnds2 %xmm0, %xmm1, %xmm2
+           pshufd $$0x0E, %xmm0, %xmm0
+           sha256rnds2 %xmm0, %xmm2, %xmm1
+           movdqa %xmm3, %xmm11
+           sha256msg1 %xmm4, %xmm11
+           movdqa %xmm6, %xmm12
+           palignr $$4, %xmm5, %xmm12
+           paddd %xmm12, %xmm11
+           sha256msg2 %xmm6, %xmm11
+           movdqa %xmm11, %xmm7
+           movdqa %xmm7, %xmm0
+           paddd 64(%rcx), %xmm0
+           sha256rnds2 %xmm0, %xmm1, %xmm2
+           pshufd $$0x0E, %xmm0, %xmm0
+           sha256rnds2 %xmm0, %xmm2, %xmm1
+           movdqa %xmm4, %xmm11
+           sha256msg1 %xmm5, %xmm11
+           movdqa %xmm7, %xmm12
+           palignr $$4, %xmm6, %xmm12
+           paddd %xmm12, %xmm11
+           sha256msg2 %xmm7, %xmm11
+           movdqa %xmm11, %xmm3
+           movdqa %xmm3, %xmm0
+           paddd 80(%rcx), %xmm0
+           sha256rnds2 %xmm0, %xmm1, %xmm2
+           pshufd $$0x0E, %xmm0, %xmm0
+           sha256rnds2 %xmm0, %xmm2, %xmm1
+           movdqa %xmm5, %xmm11
+           sha256msg1 %xmm6, %xmm11
+           movdqa %xmm3, %xmm12
+           palignr $$4, %xmm7, %xmm12
+           paddd %xmm12, %xmm11
+           sha256msg2 %xmm3, %xmm11
+           movdqa %xmm11, %xmm4
+           movdqa %xmm4, %xmm0
+           paddd 96(%rcx), %xmm0
+           sha256rnds2 %xmm0, %xmm1, %xmm2
+           pshufd $$0x0E, %xmm0, %xmm0
+           sha256rnds2 %xmm0, %xmm2, %xmm1
+           movdqa %xmm6, %xmm11
+           sha256msg1 %xmm7, %xmm11
+           movdqa %xmm4, %xmm12
+           palignr $$4, %xmm3, %xmm12
+           paddd %xmm12, %xmm11
+           sha256msg2 %xmm4, %xmm11
+           movdqa %xmm11, %xmm5
+           movdqa %xmm5, %xmm0
+           paddd 112(%rcx), %xmm0
+           sha256rnds2 %xmm0, %xmm1, %xmm2
+           pshufd $$0x0E, %xmm0, %xmm0
+           sha256rnds2 %xmm0, %xmm2, %xmm1
+           movdqa %xmm7, %xmm11
+           sha256msg1 %xmm3, %xmm11
+           movdqa %xmm5, %xmm12
+           palignr $$4, %xmm4, %xmm12
+           paddd %xmm12, %xmm11
+           sha256msg2 %xmm5, %xmm11
+           movdqa %xmm11, %xmm6
+           movdqa %xmm6, %xmm0
+           paddd 128(%rcx), %xmm0
+           sha256rnds2 %xmm0, %xmm1, %xmm2
+           pshufd $$0x0E, %xmm0, %xmm0
+           sha256rnds2 %xmm0, %xmm2, %xmm1
+           movdqa %xmm3, %xmm11
+           sha256msg1 %xmm4, %xmm11
+           movdqa %xmm6, %xmm12
+           palignr $$4, %xmm5, %xmm12
+           paddd %xmm12, %xmm11
+           sha256msg2 %xmm6, %xmm11
+           movdqa %xmm11, %xmm7
+           movdqa %xmm7, %xmm0
+           paddd 144(%rcx), %xmm0
+           sha256rnds2 %xmm0, %xmm1, %xmm2
+           pshufd $$0x0E, %xmm0, %xmm0
+           sha256rnds2 %xmm0, %xmm2, %xmm1
+           movdqa %xmm4, %xmm11
+           sha256msg1 %xmm5, %xmm11
+           movdqa %xmm7, %xmm12
+           palignr $$4, %xmm6, %xmm12
+           paddd %xmm12, %xmm11
+           sha256msg2 %xmm7, %xmm11
+           movdqa %xmm11, %xmm3
+           movdqa %xmm3, %xmm0
+           paddd 160(%rcx), %xmm0
+           sha256rnds2 %xmm0, %xmm1, %xmm2
+           pshufd $$0x0E, %xmm0, %xmm0
+           sha256rnds2 %xmm0, %xmm2, %xmm1
+           movdqa %xmm5, %xmm11
+           sha256msg1 %xmm6, %xmm11
+           movdqa %xmm3, %xmm12
+           palignr $$4, %xmm7, %xmm12
+           paddd %xmm12, %xmm11
+           sha256msg2 %xmm3, %xmm11
+           movdqa %xmm11, %xmm4
+           movdqa %xmm4, %xmm0
+           paddd 176(%rcx), %xmm0
+           sha256rnds2 %xmm0, %xmm1, %xmm2
+           pshufd $$0x0E, %xmm0, %xmm0
+           sha256rnds2 %xmm0, %xmm2, %xmm1
+           movdqa %xmm6, %xmm11
+           sha256msg1 %xmm7, %xmm11
+           movdqa %xmm4, %xmm12
+           palignr $$4, %xmm3, %xmm12
+           paddd %xmm12, %xmm11
+           sha256msg2 %xmm4, %xmm11
+           movdqa %xmm11, %xmm5
+           movdqa %xmm5, %xmm0
+           paddd 192(%rcx), %xmm0
+           sha256rnds2 %xmm0, %xmm1, %xmm2
+           pshufd $$0x0E, %xmm0, %xmm0
+           sha256rnds2 %xmm0, %xmm2, %xmm1
+           movdqa %xmm7, %xmm11
+           sha256msg1 %xmm3, %xmm11
+           movdqa %xmm5, %xmm12
+           palignr $$4, %xmm4, %xmm12
+           paddd %xmm12, %xmm11
+           sha256msg2 %xmm5, %xmm11
+           movdqa %xmm11, %xmm6
+           movdqa %xmm6, %xmm0
+           paddd 208(%rcx), %xmm0
+           sha256rnds2 %xmm0, %xmm1, %xmm2
+           pshufd $$0x0E, %xmm0, %xmm0
+           sha256rnds2 %xmm0, %xmm2, %xmm1
+           movdqa %xmm3, %xmm11
+           sha256msg1 %xmm4, %xmm11
+           movdqa %xmm6, %xmm12
+           palignr $$4, %xmm5, %xmm12
+           paddd %xmm12, %xmm11
+           sha256msg2 %xmm6, %xmm11
+           movdqa %xmm11, %xmm7
+           movdqa %xmm7, %xmm0
+           paddd 224(%rcx), %xmm0
+           sha256rnds2 %xmm0, %xmm1, %xmm2
+           pshufd $$0x0E, %xmm0, %xmm0
+           sha256rnds2 %xmm0, %xmm2, %xmm1
+           movdqa %xmm4, %xmm11
+           sha256msg1 %xmm5, %xmm11
+           movdqa %xmm7, %xmm12
+           palignr $$4, %xmm6, %xmm12
+           paddd %xmm12, %xmm11
+           sha256msg2 %xmm7, %xmm11
+           movdqa %xmm11, %xmm3
+           movdqa %xmm3, %xmm0
+           paddd 240(%rcx), %xmm0
+           sha256rnds2 %xmm0, %xmm1, %xmm2
+           pshufd $$0x0E, %xmm0, %xmm0
+           sha256rnds2 %xmm0, %xmm2, %xmm1
+           paddd %xmm9, %xmm1
+           paddd %xmm10, %xmm2
+           addq $$64, %r9
+           decq %r10
+           jnz 1b
+           pshufd $$0x1B, %xmm1, %xmm1
+           pshufd $$0xB1, %xmm2, %xmm2
+           movdqa %xmm1, %xmm11
+           pblendw $$0xF0, %xmm2, %xmm11
+           palignr $$8, %xmm1, %xmm2
+           movdqu %xmm11, (%rdi)
+           movdqu %xmm2, 16(%rdi)"
+              :: "{rdi}"(state), "{rsi}"(data), "{rdx}"(count.to_u64), "{rcx}"(k), "{r8}"(mask)
+              : "r9", "r10", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6",
+                "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "memory", "cc"
+              : "volatile")
+    end
+  {% end %}
+
+  private def ror(x : UInt32, n : Int32) : UInt32
+    x.unsafe_shr(n) | x.unsafe_shl(32 - n)
+  end
+
+  # One block, soft.rs's `compress_u32`: the schedule, then 64 rounds.
+  private def compress_soft(block : Pointer(UInt8)) : Nil
+    w = uninitialized UInt32[64]
+    i = 0
+    while i < 16
+      p = block + i * 4
+      w[i] = p[0].to_u32.unsafe_shl(24) | p[1].to_u32.unsafe_shl(16) |
+             p[2].to_u32.unsafe_shl(8) | p[3].to_u32
+      i = i + 1
+    end
+    while i < 64
+      x = w[i - 15]
+      y = w[i - 2]
+      s0 = ror(x, 7) ^ ror(x, 18) ^ x.unsafe_shr(3)
+      s1 = ror(y, 17) ^ ror(y, 19) ^ y.unsafe_shr(10)
+      w[i] = w[i - 16] &+ s0 &+ w[i - 7] &+ s1
+      i = i + 1
+    end
+    a = @state[0]
+    b = @state[1]
+    c = @state[2]
+    d = @state[3]
+    e = @state[4]
+    f = @state[5]
+    g = @state[6]
+    h = @state[7]
+    i = 0
+    while i < 64
+      s1 = ror(e, 6) ^ ror(e, 11) ^ ror(e, 25)
+      ch = (e & f) ^ (~e & g)
+      t1 = h &+ s1 &+ ch &+ K[i] &+ w[i]
+      s0 = ror(a, 2) ^ ror(a, 13) ^ ror(a, 22)
+      maj = (a & b) ^ (a & c) ^ (b & c)
+      t2 = s0 &+ maj
+      h = g
+      g = f
+      f = e
+      e = d &+ t1
+      d = c
+      c = b
+      b = a
+      a = t1 &+ t2
+      i = i + 1
+    end
+    @state[0] = @state[0] &+ a
+    @state[1] = @state[1] &+ b
+    @state[2] = @state[2] &+ c
+    @state[3] = @state[3] &+ d
+    @state[4] = @state[4] &+ e
+    @state[5] = @state[5] &+ f
+    @state[6] = @state[6] &+ g
+    @state[7] = @state[7] &+ h
+  end
+end

@@ -6,7 +6,10 @@
 #
 # `Sha256.hexdigest(data)` hashes one piece; `Sha256.new`, `update` as
 # the data arrives, then `final` or `hexfinal` once, hashes it in pieces.
-# Data is a `Str` or a `String`.
+# Data is a `Str` or a `String`. A digest is a value, on the stack: no
+# heap object, nothing allocated while it hashes. Being a struct, it is
+# copied when passed, so `update` answers nothing to chain on a copy;
+# keep it in a variable or a field and update that.
 #
 # `@[Ffi]` because the asm is an edge as a C library's is: it takes the
 # state and the data by pointer. Nothing outside this module sees one.
@@ -39,10 +42,10 @@ K = [
 HEX = "0123456789abcdef"
 
 # Bytes of whole blocks `update` copies off a Str at a time: one block,
-# in the digest itself, so a digest is one small object.
+# in the digest itself, so a digest stays a small value.
 BUFFER = 64
 
-pub class Sha256
+pub struct Sha256
   # A, B, ..., H.
   @state : UInt32[8]
   # The message's last bytes that do not yet make a block.
@@ -101,14 +104,14 @@ pub class Sha256
     @finished = false
   end
 
-  def update(data : String) : self
+  def update(data : String) : Nil
     update(Str.view(data))
   end
 
   # A Str's bytes are read as the tape allows, with bounds: the whole
   # blocks eight bytes a load into the buffer, up to `BUFFER` at a time,
   # then hashed from there; a part block byte by byte into `@block`.
-  def update(data : Str) : self
+  def update(data : Str) : Nil
     raise "Sha256#update after final" if @finished
     size = data.bytesize
     @length = @length &+ size.to_u64
@@ -119,7 +122,7 @@ pub class Sha256
         @fill = @fill + 1
         at = at + 1
       end
-      return self if @fill < 64
+      return if @fill < 64
       compress(pointerof(@block).as(Pointer(UInt8)), 1)
       @fill = 0
     end
@@ -141,7 +144,6 @@ pub class Sha256
       @fill = @fill + 1
       at = at + 1
     end
-    self
   end
 
   # The 32 bytes of the digest, nothing allocated.

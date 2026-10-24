@@ -16,8 +16,13 @@ Sha256.hexdigest("abc") # => "ba7816bf..."
 
 digest = Sha256.new
 digest.update(part) # a Str or a String, as often as the data arrives
-digest.hexfinal     # or `final`: the 32 bytes
+digest.hexfinal     # or `final`: the 32 bytes, or `hexfinal(w)` onto a
+                    # Str::Builder
 ```
+
+`Sha256` is a struct: a digest is a value on the stack, and hashing
+allocates nothing. It is copied when passed, so `update` answers `Nil`
+rather than a copy to chain on: keep a digest in a variable or a field.
 
 The digests are FIPS 180-4's, the same as std/digest's `SHA256`.
 

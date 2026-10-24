@@ -38,16 +38,17 @@ K = [
 
 HEX = "0123456789abcdef"
 
-# Bytes of whole blocks `update` copies off a Str at a time.
-BUFFER = 4096
+# Bytes of whole blocks `update` copies off a Str at a time: one block,
+# in the digest itself, so a digest is one small object.
+BUFFER = 64
 
 pub class Sha256
   # A, B, ..., H.
-  @state : Pointer(UInt32)
+  @state : UInt32[8]
   # The message's last bytes that do not yet make a block.
-  @block : Pointer(UInt8)
+  @block : UInt8[64]
   # Whole blocks copied off a Str, for the asm to read.
-  @buffer : Pointer(UInt8)
+  @buffer : UInt8[64]
   @fill : Int32
   @length : UInt64
   @finished : Bool
@@ -61,9 +62,9 @@ pub class Sha256
   @@filled : Bool = false
 
   def initialize
-    @state = Pointer(UInt32).malloc(8_u64)
-    @block = Pointer(UInt8).malloc(64_u64)
-    @buffer = Pointer(UInt8).malloc(BUFFER.to_u64)
+    @state = uninitialized UInt32[8]
+    @block = uninitialized UInt8[64]
+    @buffer = uninitialized UInt8[64]
     @fill = 0
     @length = 0_u64
     @finished = false
@@ -119,10 +120,11 @@ pub class Sha256
         at = at + 1
       end
       return self if @fill < 64
-      compress(@block, 1)
+      compress(pointerof(@block).as(Pointer(UInt8)), 1)
       @fill = 0
     end
-    words = @buffer.as(Pointer(UInt64))
+    buffer = pointerof(@buffer).as(Pointer(UInt8))
+    words = buffer.as(Pointer(UInt64))
     while size - at >= 64
       blocks = Math.min((size - at) // 64, BUFFER // 64)
       i = 0
@@ -131,7 +133,7 @@ pub class Sha256
         words[i] = data.read_bytes_at(UInt64, at + i * 8)
         i = i + 1
       end
-      compress(@buffer, blocks)
+      compress(buffer, blocks)
       at = at + blocks * 64
     end
     while at < size
@@ -142,8 +144,8 @@ pub class Sha256
     self
   end
 
-  # The 32 bytes of the digest.
-  def final : Array(UInt8)
+  # The 32 bytes of the digest, nothing allocated.
+  def final : UInt8[32]
     raise "Sha256#final twice" if @finished
     bits = @length &* 8_u64
     @block[@fill] = 0x80_u8
@@ -153,7 +155,7 @@ pub class Sha256
         @block[@fill] = 0_u8
         @fill = @fill + 1
       end
-      compress(@block, 1)
+      compress(pointerof(@block).as(Pointer(UInt8)), 1)
       @fill = 0
     end
     while @fill < 56
@@ -165,25 +167,29 @@ pub class Sha256
       @block[56 + i] = (bits.unsafe_shr(56 - 8 * i) & 255_u64).to_u8
       i = i + 1
     end
-    compress(@block, 1)
+    compress(pointerof(@block).as(Pointer(UInt8)), 1)
     @finished = true
-    out = Array(UInt8).new(32)
+    out = uninitialized UInt8[32]
     i = 0
-    while i < 8
-      word = @state[i]
-      out << (word.unsafe_shr(24) & 255_u32).to_u8
-      out << (word.unsafe_shr(16) & 255_u32).to_u8
-      out << (word.unsafe_shr(8) & 255_u32).to_u8
-      out << (word & 255_u32).to_u8
+    while i < 32
+      out[i] = (@state[i // 4].unsafe_shr(24 - i % 4 * 8) & 255_u32).to_u8
       i = i + 1
     end
     out
   end
 
+  # The digest's 64 hex digits onto *w*, the tape's writer.
+  def hexfinal(w : Str::Builder) : Nil
+    final.each do |byte|
+      w << HEX[(byte.unsafe_shr(4)).to_i32]
+      w << HEX[(byte & 0x0f_u8).to_i32]
+    end
+  end
+
   def hexfinal : String
     String.build(64) do |io|
       final.each do |byte|
-        io << HEX[(byte >> 4).to_i32]
+        io << HEX[byte.unsafe_shr(4).to_i32]
         io << HEX[(byte & 0x0f_u8).to_i32]
       end
     end
@@ -193,7 +199,7 @@ pub class Sha256
   private def compress(data : Pointer(UInt8), count : Int32) : Nil
     {% if flag?(:x86_64) %}
       if Sha256.shani?
-        Sha256.compress_shani(@state, data, count)
+        Sha256.compress_shani(pointerof(@state).as(Pointer(UInt32)), data, count)
         return
       end
     {% end %}

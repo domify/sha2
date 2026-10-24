@@ -60,6 +60,13 @@ end
 abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
 failures = 0
 failures = failures + 1 unless Sha256.hexdigest("abc") == abc
+tape do
+  w = Str::Builder.new(64)
+  digest = Sha256.new
+  digest.update("abc")
+  digest.hexfinal(w)
+  failures = failures + 1 unless w.finish.to_heap == abc
+end
 failures = check("native", failures)
 puts "native: SHA-NI #{Sha256.shani? ? "yes" : "no"}"
 Sha256.use_software

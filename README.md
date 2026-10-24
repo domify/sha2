@@ -36,7 +36,7 @@ A 416,074-byte page, one core of a Ryzen 7 PRO 6850U, `--release`:
   instruction per intrinsic, written by `tools/gen_asm.py`. `cpuid` is
   asked once for SHA-NI, SSSE3 and SSE4.1.
 - A `Str` is read as the tape allows: whole blocks eight bytes a load
-  into a 4 KB buffer, hashed from there.
+  into a one-block buffer in the digest, hashed from there.
 - The module is `@[Ffi]`, as the asm takes pointers; the API has none.
 
 ## Checks

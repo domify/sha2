@@ -66,6 +66,13 @@ tape do
   digest.update("abc")
   digest.hexfinal(w)
   failures = failures + 1 unless w.finish.to_heap == abc
+  [0, 1, 31, 32, 63, 64].each do |digits|
+    part = Str::Builder.new(64)
+    digest = Sha256.new
+    digest.update("abc")
+    digest.hexfinal(part, digits)
+    failures = failures + 1 unless part.finish.to_heap == abc[0, digits]
+  end
 end
 failures = check("native", failures)
 puts "native: SHA-NI #{Sha256.shani? ? "yes" : "no"}"

@@ -182,9 +182,17 @@ pub struct Sha256
 
   # The digest's 64 hex digits onto *w*, the tape's writer.
   def hexfinal(w : Str::Builder) : Nil
+    hexfinal(w, 64)
+  end
+
+  # The first *digits* hex digits of the digest onto *w*, as a weak ETag
+  # takes 32 of them, with no string to cut them from.
+  def hexfinal(w : Str::Builder, digits : Int32) : Nil
+    i = 0
     final.each do |byte|
-      w << HEX[(byte.unsafe_shr(4)).to_i32]
-      w << HEX[(byte & 0x0f_u8).to_i32]
+      w << HEX[(byte.unsafe_shr(4)).to_i32] if i < digits
+      w << HEX[(byte & 0x0f_u8).to_i32] if i + 1 < digits
+      i += 2
     end
   end
 
